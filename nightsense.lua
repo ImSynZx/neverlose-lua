@@ -574,7 +574,7 @@ local function newSlot(idx)
         }
     }
     
-    local cur_tick = globals.tickcount()
+    local cur_tick = globals.tickcount
     if type(cur_tick) == "function" then cur_tick = cur_tick() end
     p.last_memory_update_tick = cur_tick or 0
     p.last_freestand_tick = 0
@@ -584,7 +584,7 @@ local function newSlot(idx)
 end
 
 local function decayMemory(p)
-    local cur_tick = globals.tickcount()
+    local cur_tick = globals.tickcount
     if type(cur_tick) == "function" then cur_tick = cur_tick() end
     cur_tick = cur_tick or 0
     local elapsed = cur_tick - (p.last_memory_update_tick or cur_tick)
@@ -767,7 +767,7 @@ local function defensiveUpdate(p, sim_time, speed, feet_yaw, prev_feet_yaw)
 end
 
 local function updateAdvancedFreestand(p, ent)
-    local cur_tick = globals.tickcount()
+    local cur_tick = globals.tickcount
     if type(cur_tick) == "function" then cur_tick = cur_tick() end
     cur_tick = cur_tick or 0
     
@@ -894,7 +894,7 @@ local function predictMarkovSide(p)
 end
 
 local function updateJitterCycle(p, current_side)
-    local cur_tick = globals.tickcount()
+    local cur_tick = globals.tickcount
     if type(cur_tick) == "function" then cur_tick = cur_tick() end
     cur_tick = cur_tick or 0
     
@@ -908,7 +908,7 @@ local function updateJitterCycle(p, current_side)
 end
 
 local function predictJitterCycleSide(p)
-    local cur_tick = globals.tickcount()
+    local cur_tick = globals.tickcount
     if type(cur_tick) == "function" then cur_tick = cur_tick() end
     cur_tick = cur_tick or 0
     
