@@ -317,7 +317,6 @@ local PAT_DEFENSIVE_AA    = 4
 
 local TEST_OFFSETS = { 0, 18, 36 }
 local HEIGHT_OFFSETS = { 0, -25, -45 }
-local temp_branches = { 1, 2, 3, 4, 5 }
 
 local function getDesyncLimit(speed, duck, on_ground)
     if not on_ground then return 58.0 end
@@ -353,21 +352,14 @@ local function newSlot(idx)
     if not PersistentProfiles[steamid] then
         PersistentProfiles[steamid] = {
             profiles = {
-                standing = { best_side = 0, success_rate = 0.0, sample_count = 0, hits = { [-1]=0, [0]=0, [1]=0 }, misses = { [-1]=0, [0]=0, [1]=0 } },
-                moving   = { best_side = 0, success_rate = 0.0, sample_count = 0, hits = { [-1]=0, [0]=0, [1]=0 }, misses = { [-1]=0, [0]=0, [1]=0 } },
-                air      = { best_side = 0, success_rate = 0.0, sample_count = 0, hits = { [-1]=0, [0]=0, [1]=0 }, misses = { [-1]=0, [0]=0, [1]=0 } },
-                exploit  = { best_side = 0, success_rate = 0.0, sample_count = 0, hits = { [-1]=0, [0]=0, [1]=0 }, misses = { [-1]=0, [0]=0, [1]=0 } }
+                standing = { bias = 1 },
+                moving   = { bias = 1 },
+                air      = { bias = 1 },
+                exploit  = { bias = 1 }
             },
             sig_memory = {},
             archetype = ARC_STATIC,
-            observed_successful = {},
-            brute_history = {
-                { branch = 1, hits = 0, misses = 0 },
-                { branch = 2, hits = 0, misses = 0 },
-                { branch = 3, hits = 0, misses = 0 },
-                { branch = 4, hits = 0, misses = 0 },
-                { branch = 5, hits = 0, misses = 0 }
-            }
+            observed_successful = {}
         }
     end
     
@@ -380,7 +372,6 @@ local function newSlot(idx)
         
         profiles            = prof.profiles,
         sig_memory          = prof.sig_memory,
-        brute_history       = prof.brute_history,
         observed_successful = prof.observed_successful,
         
         resolved_side      = 0,
@@ -388,6 +379,8 @@ local function newSlot(idx)
         consecutive_resolver_misses = 0,
         consecutive_resolver_hits = 0,
         lock_level         = 0,
+        last_lby_update_time = nil,
+        lby_update_predicted = false,
         
         curr_sim_time  = 0.0,
         prev_feet_yaw  = 0.0,
@@ -430,7 +423,6 @@ local function newSlot(idx)
             observed_recent = 30.0
         },
         
-        brute_idx = 0,
         speed = 0.0,
         duck = 0.0,
         on_ground = true
@@ -565,6 +557,31 @@ local function updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_ya
         if p.steamid and PersistentProfiles[p.steamid] then
             PersistentProfiles[p.steamid].archetype = p.archetype
         end
+
+        if speed < 1.0 then
+            if not p.last_lby_update_time then
+                p.last_lby_update_time = sim_time
+                p.lby_update_predicted = false
+            elseif sim_time - p.last_lby_update_time >= 1.1 then
+                p.lby_update_predicted = true
+                p.last_lby_update_time = sim_time
+            else
+                p.lby_update_predicted = false
+            end
+        else
+            p.last_lby_update_time = nil
+            p.lby_update_predicted = false
+        end
+
+        p.is_fakewalk = false
+        if layers then
+            local l6 = layers[6]
+            if l6 and speed > 1.0 and speed < 100.0 then
+                if l6.m_flWeight > 0.8 and l6.m_flPlaybackRate < 0.15 then
+                    p.is_fakewalk = true
+                end
+            end
+        end
         
         p.curr_sim_time = sim_time
     elseif p.curr_sim_time == 0.0 and sim_time > 0 then
@@ -693,7 +710,14 @@ local function computeBrute(p, ent, layers)
     local state = getTargetState(p)
     local limit = p.resolved_delta or p.desync_limit
     
-    -- 1. Apply Adaptive Lock overrides (HARD and MEDIUM lock levels)
+    if p.is_fakewalk then
+        limit = 28.0
+    end
+
+    if p.lby_update_predicted then
+        p.lock_level = 0
+    end
+
     if p.lock_level == 3 and p.locked_side then
         p.resolved_side = p.locked_side
         p.resolved_delta = clamp(p.locked_delta or limit, 0.0, p.desync_limit)
@@ -704,19 +728,15 @@ local function computeBrute(p, ent, layers)
         return
     end
 
-    -- 2. Fake Flick modifications (invalidate locks / signature confidence)
-    local use_signature_memory = not p.flick_detected
     if p.flick_detected then
         p.lock_level = 0
-        p.brute_idx = p.brute_idx + 1
     end
 
-    -- 3. LC state and Defensive AA modifications
     if p.lc_state == LC_BROKEN or p.lc_state == LC_TELEPORT then
         limit = limit * 0.7
     elseif p.lc_state == LC_SHIFTED or p.defensive_confidence > 0.5 then
         p.lock_level = math_min(p.lock_level, 1)
-        limit = p.desync_limit -- Expand brute search range
+        limit = p.desync_limit
     end
 
     if p.lc_state == LC_TELEPORT then
@@ -725,91 +745,47 @@ local function computeBrute(p, ent, layers)
         return
     end
 
-    -- 4. Find Best Side from Signature or State Profile
-    local best_side = 0
-    local sig = use_signature_memory and p.sig_memory[p.current_sig_hash]
-    if sig then
-        local max_score = -9999
-        for _, s in ipairs({-1, 1, 0}) do
-            local hits = sig.hits[s] or 0
-            local misses = sig.misses[s] or 0
-            local score = hits - misses
-            if score > max_score and (hits > 0 or misses > 0) then
-                max_score = score
-                best_side = s
-            end
+    local anim = SafeGetAnimState(ent)
+    local eye_yaw = anim and anim.m_flEyeYaw or 0.0
+
+    local calculated_delta = limit
+    local calculated_side = 0
+
+    if layers and layers[3] then
+        local l3 = layers[3]
+        calculated_delta = clamp(l3.m_flWeight * 58.0, 15.0, p.desync_limit)
+        
+        local lp = entity.get_local_player()
+        if lp then
+            local lpx, lpy = SafeGetOrigin(lp)
+            local ex, ey = SafeGetOrigin(ent)
+            local to_lp = math_atan2(lpy - ey, lpx - ex) * (180 / math_pi)
+            local eye_to_lp = yawDelta(eye_yaw, to_lp)
+            calculated_side = eye_to_lp > 0 and 1 or -1
+        else
+            calculated_side = p.freestand_side ~= 0 and p.freestand_side or 1
         end
+
+        if p.flick_detected then
+            calculated_side = -calculated_side
+        end
+    else
+        calculated_side = p.freestand_side ~= 0 and p.freestand_side or 1
     end
-    
-    if best_side == 0 then
+
+    local bias = 1
+    local sig = p.sig_memory[p.current_sig_hash]
+    if sig and sig.bias then
+        bias = sig.bias
+    else
         local profile = p.profiles[state]
-        if profile and profile.sample_count > 0 then
-            local max_score = -9999
-            for _, s in ipairs({-1, 1, 0}) do
-                local hits = profile.hits[s] or 0
-                local misses = profile.misses[s] or 0
-                local score = hits - misses
-                if score > max_score and (hits > 0 or misses > 0) then
-                    max_score = score
-                    best_side = s
-                end
-            end
+        if profile and profile.bias then
+            bias = profile.bias
         end
     end
 
-    -- 5. Brute Tree branch selection with Dynamic Reordering
-    -- Sort local temp_branches based on brute history branch success rates
-    temp_branches[1] = 1
-    temp_branches[2] = 2
-    temp_branches[3] = 3
-    temp_branches[4] = 4
-    temp_branches[5] = 5
-
-    table.sort(temp_branches, function(a, b)
-        local ha, ma = p.brute_history[a].hits, p.brute_history[a].misses
-        local hb, mb = p.brute_history[b].hits, p.brute_history[b].misses
-        local ra = (ha + 1) / (ha + ma + 2)
-        local rb = (hb + 1) / (hb + mb + 2)
-        return ra > rb
-    end)
-
-    local idx = p.brute_idx or 0
-    local step = (idx % 5) + 1
-    local branch_choice = temp_branches[step]
-
-    -- Defensive AA adjustments: override choice to prioritize Half Left/Right
-    if p.defensive_confidence > 0.5 and (branch_choice == 1 or branch_choice == 2) then
-        branch_choice = 4 -- Force Half Left fallback
-    end
-
-    -- Map branch choice to side and delta
-    local side = best_side
-    if side == 0 then
-        side = p.freestand_side ~= 0 and p.freestand_side or 1
-    end
-
-    local final_side = 0
-    local final_delta = limit
-
-    if branch_choice == 1 then
-        final_side = side
-        final_delta = limit
-    elseif branch_choice == 2 then
-        final_side = -side
-        final_delta = limit
-    elseif branch_choice == 3 then
-        final_side = 0
-        final_delta = 0.0
-    elseif branch_choice == 4 then
-        final_side = -1
-        final_delta = limit * 0.5
-    else -- branch_choice == 5
-        final_side = 1
-        final_delta = limit * 0.5
-    end
-
-    p.resolved_side = final_side
-    p.resolved_delta = clamp(final_delta, 0.0, p.desync_limit)
+    p.resolved_side = calculated_side * bias
+    p.resolved_delta = clamp(calculated_delta, 0.0, p.desync_limit)
 end
 
 local function updatePlayer(p, ent)
@@ -894,7 +870,7 @@ local function shouldPreferSafe(p)
     local cm = p.consecutive_resolver_misses
     local active_exploit = p.lc_broken or p.sim_shifted or p.fake_movement_burst or p.is_defensive_aa
     
-    if cm >= 1 then return true end
+    if cm >= 1 or p.lby_update_predicted then return true end
     if p.choke > 6 or active_exploit then return true end
     if p.pattern == PAT_FAKE_FLICK or p.pattern == PAT_MICRO_FLICK or p.pattern == PAT_DEFENSIVE_FLICK then return true end
     
@@ -1011,35 +987,10 @@ register_event("pre_render", function()
     end
 end)
 
-local function getEvidenceWeight(state, hitgroup, choke, lock_level)
-    local weight = 1.0
-    local is_head = (hitgroup == 1)
-    
-    if state == "standing" then
-        weight = is_head and 2.0 or 1.0
-    elseif state == "moving" then
-        weight = is_head and 1.5 or 0.5
-    end
-    
-    if choke >= 5 then
-        weight = weight + 0.5
-    end
-    
-    if lock_level <= 1 then
-        weight = weight + 0.3
-    end
-    
-    return weight
-end
-
 register_event("aim_fire", function(e)
     if not e then return end
     local p = EnemyRecords[e.target]
     if not p then return end
-    
-    local idx = p.brute_idx or 0
-    local step = (idx % 5) + 1
-    local branch_choice = temp_branches[step]
     
     aimbot_data[e.id] = {
         target = e.target,
@@ -1049,8 +1000,7 @@ register_event("aim_fire", function(e)
         sig_hash = p.current_sig_hash,
         state = getTargetState(p),
         lock_level = p.lock_level,
-        choke = p.choke,
-        branch_choice = branch_choice
+        choke = p.choke
     }
 end)
 
@@ -1065,7 +1015,6 @@ register_event("aim_ack", function(e)
     
     p.consecutive_resolver_hits = p.consecutive_resolver_hits + 1
     p.consecutive_resolver_misses = 0
-    p.brute_idx = 0
     
     if p.consecutive_resolver_hits >= 3 then
         p.lock_level = 3
@@ -1078,35 +1027,6 @@ register_event("aim_ack", function(e)
     p.locked_side = shot.side
     p.locked_delta = shot.delta
     p.observed_successful[shot.state] = shot.delta
-    
-    local side = shot.side
-    local state = shot.state
-    local sig_hash = shot.sig_hash
-    local branch_choice = shot.branch_choice
-    
-    local w = getEvidenceWeight(state, shot.hitgroup, shot.choke, shot.lock_level)
-    
-    if sig_hash ~= 0 then
-        p.sig_memory[sig_hash] = p.sig_memory[sig_hash] or {
-            hits = { [-1] = 0, [0] = 0, [1] = 0 },
-            misses = { [-1] = 0, [0] = 0, [1] = 0 }
-        }
-        p.sig_memory[sig_hash].hits[side] = (p.sig_memory[sig_hash].hits[side] or 0) + w
-    end
-    
-    local profile = p.profiles[state]
-    if profile then
-        profile.hits[side] = (profile.hits[side] or 0) + w
-        profile.sample_count = profile.sample_count + w
-        
-        local total_hits = profile.hits[-1] + profile.hits[1] + profile.hits[0]
-        local total_misses = profile.misses[-1] + profile.misses[1] + profile.misses[0]
-        profile.success_rate = total_hits / (total_hits + total_misses + 1)
-    end
-    
-    if branch_choice and p.brute_history[branch_choice] then
-        p.brute_history[branch_choice].hits = p.brute_history[branch_choice].hits + w
-    end
 end)
 
 register_event("aim_miss", function(e)
@@ -1122,36 +1042,20 @@ register_event("aim_miss", function(e)
     local side = shot.side
     local state = shot.state
     local sig_hash = shot.sig_hash
-    local branch_choice = shot.branch_choice
     
     if reason == "resolver" or reason == "correction" then
         p.consecutive_resolver_hits = 0
         p.consecutive_resolver_misses = p.consecutive_resolver_misses + 1
-        p.brute_idx = p.brute_idx + 1
         p.lock_level = math_max(0, p.lock_level - 1)
         
-        local w = getEvidenceWeight(state, shot.hitgroup, shot.choke, shot.lock_level)
-        
         if sig_hash ~= 0 then
-            p.sig_memory[sig_hash] = p.sig_memory[sig_hash] or {
-                hits = { [-1] = 0, [0] = 0, [1] = 0 },
-                misses = { [-1] = 0, [0] = 0, [1] = 0 }
-            }
-            p.sig_memory[sig_hash].misses[side] = (p.sig_memory[sig_hash].misses[side] or 0) + w
+            p.sig_memory[sig_hash] = p.sig_memory[sig_hash] or { bias = 1 }
+            p.sig_memory[sig_hash].bias = -p.sig_memory[sig_hash].bias
         end
         
         local profile = p.profiles[state]
         if profile then
-            profile.misses[side] = (profile.misses[side] or 0) + w
-            profile.sample_count = profile.sample_count + w
-            
-            local total_hits = profile.hits[-1] + profile.hits[1] + profile.hits[0]
-            local total_misses = profile.misses[-1] + profile.misses[1] + profile.misses[0]
-            profile.success_rate = total_hits / (total_hits + total_misses + 1)
-        end
-        
-        if branch_choice and p.brute_history[branch_choice] then
-            p.brute_history[branch_choice].misses = p.brute_history[branch_choice].misses + w
+            profile.bias = -(profile.bias or 1)
         end
     end
 end)
