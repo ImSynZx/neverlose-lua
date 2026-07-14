@@ -11,6 +11,26 @@ local client = client
 local globals = globals
 local plist = plist
 
+local entity_get_local_player = entity.get_local_player
+local entity_get_players = entity.get_players
+local entity_get_player_by_index = entity.get_player_by_index
+local utils_trace_line = utils.trace_line
+local globals_curtime = globals.curtime
+local globals_tickinterval = globals.tickinterval
+
+local ffi = ffi
+local ffi_cast = ffi and ffi.cast
+
+local plist_cache = {}
+local function plist_set(id, key, val)
+    if not plist or type(plist) ~= "table" or not plist.set then return end
+    if not plist_cache[id] then plist_cache[id] = {} end
+    if plist_cache[id][key] == val then return end
+    plist_cache[id][key] = val
+    pcall(plist.set, id, key, val)
+end
+local render = render
+
 pcall(ffi.cdef, "typedef struct { float x, y, z; } vec3_t;")
 pcall(ffi.cdef, [[
     struct animation_state_t {
@@ -124,17 +144,18 @@ local GITLAB_RAW = "https://gitlab.com/" .. GITLAB_REPO .. "/-/raw/main"
 ui.sidebar("NightSense", "moon")
 local ui_info = ui.create("NightSense", icon_info .. "  Information")
 local ui_rage = ui.create("NightSense", "Ragebot")
+
 local sw_resolver  = ui_rage:switch(icon_magic   .. "  Resolver Support",  false)
-sw_resolver:tooltip("Enhances aimbot accuracy against desync by modifying enemy animation state.")
+sw_resolver:tooltip("Collects target metrics and feeds evidence-based overrides into the ragebot.")
 
 local sw_antidef   = ui_rage:switch(icon_shield  .. "  Anti-Defensive",    false)
-sw_antidef:tooltip("Predicts and counters enemy defensive double-tap and pitch manipulation.")
+sw_antidef:tooltip("Detects enemy defensive AA and forces body aim or safe points.")
 
 local sw_lethal    = ui_rage:switch(icon_fire    .. "  Lethal BAIM",       false)
-sw_lethal:tooltip("Forces body aim on lethal, low health, or hard-to-resolve targets.")
+sw_lethal:tooltip("Forces body aim dynamically based on resolver confidence and target lethality.")
 
 local sw_safepoint = ui_rage:switch(icon_arrow   .. "  Adaptive Safepoint",false)
-sw_safepoint:tooltip("Forces safepoint on targets with high acceleration, jittering, or choke.")
+sw_safepoint:tooltip("Forces safepoint on targets with low confidence, high choke, or lag instability.")
 
 local sw_priority  = ui_rage:switch(icon_bullseye.. "  Target Priority",   false)
 sw_priority:tooltip("Prioritizes threats aiming at you or low HP targets dynamically.")
@@ -166,21 +187,23 @@ network.get(GITLAB_RAW .. "/info.json", {}, function(response)
     end
 end)
 
-local native_safe, native_baim, native_mindam, native_hitchance, native_dt
-
+local native_safe, native_baim, native_mindam, native_hitchance, native_dt, native_delayshot
 pcall(function() native_safe      = ui.find("Aimbot", "Ragebot", "Safety",    "safe points")      end)
 pcall(function() native_baim      = ui.find("Aimbot", "Ragebot", "Safety",    "body aim")         end)
 pcall(function() native_mindam    = ui.find("Aimbot", "Ragebot", "Selection", "min. damage")      end)
 pcall(function() native_hitchance = ui.find("Aimbot", "Ragebot", "Selection", "hit chance")       end)
 pcall(function() native_dt        = ui.find("Aimbot", "Ragebot", "Main",    "double tap")       end)
+pcall(function() native_delayshot = ui.find("Aimbot", "Ragebot", "Selection", "delay shot")       end)
 
 local last_safe   = nil
 local last_baim   = nil
 local last_mindam = -1
+local last_hitchance = nil
+local last_delayshot = nil
 
 local function safeAddr(ptr)
     if not ptr then return nil end
-    local ok, raw = pcall(ffi.cast, "uintptr_t", ptr)
+    local ok, raw = pcall(ffi_cast, "uintptr_t", ptr)
     if not ok then return nil end
     local addr = tonumber(raw)
     return (addr and addr > 0x1000) and addr or nil
@@ -189,16 +212,16 @@ end
 local function SafeGetAnimState(ent)
     if not ent or not ent[0] then return nil end
     local ok_addr, ent_addr = pcall(function()
-        return tonumber(ffi.cast("uintptr_t", ent[0]))
+        return tonumber(ffi_cast("uintptr_t", ent[0]))
     end)
     if not ok_addr or not ent_addr or ent_addr <= 0x1000 then return nil end
     if not ffi_uintptr_ptr_t then return nil end
-    local ok_ptr, anim_ptr = pcall(ffi.cast, ffi_uintptr_ptr_t, ent_addr + ANIM_STATE_OFFSET)
+    local ok_ptr, anim_ptr = pcall(ffi_cast, ffi_uintptr_ptr_t, ent_addr + ANIM_STATE_OFFSET)
     if not ok_ptr or not anim_ptr then return nil end
     local ok_deref, anim_addr = pcall(function() return tonumber(anim_ptr[0]) end)
     if not ok_deref or not anim_addr or anim_addr <= 0x1000 then return nil end
     if not ffi_anim_state_t then return nil end
-    local ok_cast, anim = pcall(ffi.cast, ffi_anim_state_t, anim_addr)
+    local ok_cast, anim = pcall(ffi_cast, ffi_anim_state_t, anim_addr)
     if not ok_cast or not anim then return nil end
     local ok_ent, back_ent = pcall(function() return anim.m_pEntity end)
     if not ok_ent then return nil end
@@ -209,13 +232,13 @@ end
 
 local function SafeGetAnimLayers(ent)
     if not ent or not ent[0] then return nil end
-    local ent_addr = tonumber(ffi.cast("uintptr_t", ent[0]))
+    local ent_addr = tonumber(ffi_cast("uintptr_t", ent[0]))
     if not ent_addr or ent_addr <= 0x1000 then return nil end
-    local ptr = ffi.cast("uintptr_t*", ent_addr + 0x2990)
+    local ptr = ffi_cast("uintptr_t*", ent_addr + 0x2990)
     if not ptr then return nil end
     local addr = tonumber(ptr[0])
     if not addr or addr <= 0x1000 then return nil end
-    return ffi.cast("struct animation_layer_t*", addr)
+    return ffi_cast("struct animation_layer_t*", addr)
 end
 
 local function SafeGetOrigin(ent)
@@ -248,10 +271,10 @@ end
 
 local function getEntity(idx)
     if not idx then return nil end
-    if entity.get_player_by_index then
-        return entity.get_player_by_index(idx)
+    if entity_get_player_by_index then
+        return entity_get_player_by_index(idx)
     end
-    local players = entity.get_players(true, true)
+    local players = entity_get_players(true, true)
     if players then
         for i = 1, #players do
             local p = players[i]
@@ -262,26 +285,6 @@ local function getEntity(idx)
     end
     return nil
 end
-
-local function getPlayerByUserid(userid)
-    if not userid then return nil end
-    if entity.get_player_by_userid then
-        return entity.get_player_by_userid(userid)
-    end
-    local players = entity.get_players(true, true)
-    if players then
-        for i = 1, #players do
-            local p = players[i]
-            local ok, uid = pcall(function() return p:get_player_info().userid end)
-            if ok and uid == userid then
-                return p
-            end
-        end
-    end
-    return nil
-end
-
-local PersistentProfiles = {}
 
 local function getPlayerSteamID(ent)
     if not ent then return nil end
@@ -309,28 +312,61 @@ local ARC_DEFENSIVE      = 3
 local ARC_RANDOM         = 4
 local ARC_FREESTAND      = 5
 
-local PAT_STATIC          = 0
-local PAT_FAKE_FLICK      = 1
-local PAT_MICRO_FLICK     = 2
-local PAT_DEFENSIVE_FLICK = 3
-local PAT_DEFENSIVE_AA    = 4
-
 local TEST_OFFSETS = { 0, 18, 36 }
 local HEIGHT_OFFSETS = { 0, -25, -45 }
 
-local function getDesyncLimit(speed, duck, on_ground)
-    if not on_ground then return 58.0 end
-    local limit = 58.0
-    if speed > 0.1 then
-        limit = 58.0 - (58.0 * clamp(speed / 260.0, 0, 1) * 0.8)
+local aimbot_data = {}
+local shot_matrix = {}
+
+local function recordShot(steamid, state, choke, resolver_confidence, defensive_confidence, lc_state, archetype, hitgroup, result)
+    if not shot_matrix[steamid] then
+        shot_matrix[steamid] = {
+            history = {},
+            stats = {
+                standing = { shots = 0, hits = 0, misses = 0, accuracy = 0.0 },
+                moving = { shots = 0, hits = 0, misses = 0, accuracy = 0.0 },
+                air = { shots = 0, hits = 0, misses = 0, accuracy = 0.0 },
+                exploit = { shots = 0, hits = 0, misses = 0, accuracy = 0.0 }
+            }
+        }
     end
-    if duck > 0 then
-        limit = limit * (1.0 - duck) + 28.0 * duck
+    
+    local entry = {
+        state = state,
+        choke = choke,
+        resolver_confidence = resolver_confidence,
+        defensive_confidence = defensive_confidence,
+        lc_state = lc_state,
+        archetype = archetype,
+        hitgroup = hitgroup,
+        result = result
+    }
+    
+    local data = shot_matrix[steamid]
+    table_insert(data.history, entry)
+    if #data.history > 1000 then
+        table_remove(data.history, 1)
     end
-    return clamp(limit, 10.0, 58.0)
+    
+    local stats = data.stats[state]
+    if stats then
+        stats.shots = stats.shots + 1
+        if result == "hit" then
+            stats.hits = stats.hits + 1
+        else
+            stats.misses = stats.misses + 1
+        end
+        stats.accuracy = stats.hits / stats.shots
+    end
 end
 
-local aimbot_data = {}
+local function getShotMatrixAccuracy(steamid, state)
+    local data = shot_matrix[steamid]
+    if not data then return 0.50, 0 end
+    local stats = data.stats[state]
+    if not stats or stats.shots == 0 then return 0.50, 0 end
+    return stats.accuracy, stats.shots
+end
 
 local function getTargetState(p)
     if not p.on_ground then return "air" end
@@ -342,45 +378,21 @@ local function getTargetState(p)
 end
 
 local function newSlot(idx)
-    local ti = globals.tickinterval
+    local ti = globals_tickinterval
     if type(ti) == "function" then ti = ti() end
     ti = ti or 0.015625
 
     local ent = getEntity(idx)
     local steamid = getPlayerSteamID(ent) or "unknown"
     
-    if not PersistentProfiles[steamid] then
-        PersistentProfiles[steamid] = {
-            profiles = {
-                standing = { bias = 1 },
-                moving   = { bias = 1 },
-                air      = { bias = 1 },
-                exploit  = { bias = 1 }
-            },
-            sig_memory = {},
-            archetype = ARC_STATIC,
-            observed_successful = {}
-        }
-    end
-    
-    local prof = PersistentProfiles[steamid]
-
     local p = {
         id            = idx,
         tick_interval = ti,
         steamid       = steamid,
         
-        profiles            = prof.profiles,
-        sig_memory          = prof.sig_memory,
-        observed_successful = prof.observed_successful,
-        
-        resolved_side      = 0,
-        resolved_delta     = 58,
+        resolver_confidence = 0.50,
         consecutive_resolver_misses = 0,
         consecutive_resolver_hits = 0,
-        lock_level         = 0,
-        last_lby_update_time = nil,
-        lby_update_predicted = false,
         
         curr_sim_time  = 0.0,
         prev_feet_yaw  = 0.0,
@@ -390,11 +402,6 @@ local function newSlot(idx)
         last_yaw_acceleration = 0.0,
         yaw_velocity   = 0.0,
         yaw_acceleration = 0.0,
-        yaw_jerk       = 0.0,
-        flick_history_yaw = nil,
-        flick_detected = false,
-        pattern        = PAT_STATIC,
-        archetype      = prof.archetype,
         avg_yaw_delta  = 0.0,
         
         last_ox        = 0.0,
@@ -409,33 +416,181 @@ local function newSlot(idx)
         sim_shifted    = false,
         fake_movement_burst = false,
         is_defensive_aa = false,
+        defensive_confidence = 0.0,
+        lc_confidence  = 1.0,
         lc_state       = 0,
-        current_sig_hash = 0,
         
-        freestand_side = 0,
+        freestand_confidence = 0.0,
+        left_exposure = 0.0,
+        right_exposure = 0.0,
+        visibility_score = 0.0,
+        threat_score = 0.0,
         last_fs_time   = 0.0,
         last_fs_origin = { x = 0.0, y = 0.0, z = 0.0 },
         
-        desync_limit   = 58.0,
-        desync_model   = {
-            observed_max = 0.0,
-            observed_avg = 30.0,
-            observed_recent = 30.0
-        },
-        
+        archetype      = ARC_STATIC,
+        last_confidence_decay_time = nil,
         speed = 0.0,
         duck = 0.0,
-        on_ground = true
+        on_ground = true,
+        history = {},
+        is_accelerating = false,
+        predicted_peek_visible = false
     }
     
     return p
 end
 
-local function updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_yaw, speed, duck, layers)
-    local ti = p.tick_interval
-    local sim_delta = sim_time - p.curr_sim_time
+local function updateAdvancedFreestand(p, ent)
+    local cur_time = globals_curtime
+    if type(cur_time) == "function" then cur_time = cur_time() end
+    cur_time = cur_time or 0.0
     
+    local is_threat = (client.current_threat() == p.id)
+    local ox, oy, oz = SafeGetOrigin(ent)
+    local dist_sq = (ox - p.last_fs_origin.x)^2 + (oy - p.last_fs_origin.y)^2 + (oz - p.last_fs_origin.z)^2
+    local moved_significantly = dist_sq > 256.0 
+    
+    local elapsed = cur_time - p.last_fs_time
+    local throttle_interval = is_threat and 0.100 or 0.300
+    if elapsed < throttle_interval and not moved_significantly then
+        return
+    end
+    
+    p.last_fs_time = cur_time
+    p.last_fs_origin.x = ox
+    p.last_fs_origin.y = oy
+    p.last_fs_origin.z = oz
+    
+    local lp = entity_get_local_player()
+    if not lp then return end
+    
+    local head_pos = ent:get_eye_position()
+    local lp_pos = lp:get_eye_position()
+    if not head_pos or not lp_pos then return end
+    
+    local dir = (head_pos - lp_pos):normalized()
+    local left_dir = vector(-dir.y, dir.x, 0)
+    local right_dir = vector(dir.y, -dir.x, 0)
+    
+    local left_exposure = 0
+    local right_exposure = 0
+    local total_traces = 0
+    
+    for i = 1, #HEIGHT_OFFSETS do
+        local height = HEIGHT_OFFSETS[i]
+        local enemy_center = head_pos + vector(0, 0, height)
+        
+        for j = 1, #TEST_OFFSETS do
+            local offset = TEST_OFFSETS[j]
+            local left_pt = enemy_center + left_dir * offset
+            local right_pt = enemy_center + right_dir * offset
+            
+            local tr_l = utils_trace_line(lp_pos, left_pt, lp)
+            local tr_r = utils_trace_line(lp_pos, right_pt, lp)
+            
+            left_exposure = left_exposure + tr_l.fraction
+            right_exposure = right_exposure + tr_r.fraction
+            total_traces = total_traces + 1
+        end
+    end
+    
+    local avg_left_exp = left_exposure / total_traces
+    local avg_right_exp = right_exposure / total_traces
+    
+    p.left_exposure = avg_left_exp
+    p.right_exposure = avg_right_exp
+    p.visibility_score = clamp((avg_left_exp + avg_right_exp) * 0.5, 0.0, 1.0)
+    
+    local lp_x, lp_y, lp_z = SafeGetOrigin(lp)
+    local dist = math_sqrt((lp_x - ox)^2 + (lp_y - oy)^2 + (lp_z - oz)^2) * 0.0254
+    p.threat_score = clamp((1.0 - (dist / 100.0)) * 0.5 + (is_threat and 0.5 or 0.0), 0.0, 1.0)
+    
+    local exp_diff = math_abs(avg_left_exp - avg_right_exp)
+    p.freestand_confidence = clamp(exp_diff * 2.0, 0.0, 1.0)
+end
+
+local function predictTargetMovement(p, ent)
+    local lp = entity_get_local_player()
+    if not lp then return end
+    
+    local ox, oy, oz = SafeGetOrigin(ent)
+    local vx, vy, vz = 0, 0, 0
+    local vel = ent.m_vecVelocity
+    if vel then
+        vx, vy, vz = vel.x, vel.y, vel.z
+    end
+    
+    table_insert(p.history, {
+        pos = { x = ox, y = oy, z = oz },
+        vel = { x = vx, y = vy, z = vz }
+    })
+    if #p.history > 16 then
+        table_remove(p.history, 1)
+    end
+    
+    if #p.history < 2 then
+        p.is_accelerating = false
+        p.predicted_peek_visible = false
+        return
+    end
+    
+    local cur = p.history[#p.history]
+    local prev = p.history[#p.history - 1]
+    
+    local cur_vel_len = math_sqrt(cur.vel.x^2 + cur.vel.y^2)
+    local prev_vel_len = math_sqrt(prev.vel.x^2 + prev.vel.y^2)
+    p.is_accelerating = (cur_vel_len - prev_vel_len) > 25.0
+    
+    local lp_pos = lp:get_eye_position()
+    if not lp_pos then return end
+    
+    local ti = p.tick_interval or 0.015625
+    local time_step = 6 * ti
+    
+    local pred_x = cur.pos.x + cur.vel.x * time_step
+    local pred_y = cur.pos.y + cur.vel.y * time_step
+    local pred_z = cur.pos.z + cur.vel.z * time_step + 64
+    
+    local frac, trace_ent = utils_trace_line(lp_pos, vector(pred_x, pred_y, pred_z), lp)
+    p.predicted_peek_visible = (frac > 0.97)
+end
+
+local function updatePlayer(p, ent)
+    local ok_alive, alive = pcall(function() return ent:is_alive()   end)
+    local ok_dorm,  dorm  = pcall(function() return ent:is_dormant() end)
+    if not ok_dorm or dorm then return end
+
+    if not sw_resolver:get() and not sw_antidef:get() then
+        return
+    end
+
+    local anim = SafeGetAnimState(ent)
+    if not anim then return end
+
+    local ok_ey,  eye_yaw   = pcall(function() return anim.m_flEyeYaw      end)
+    local ok_fy,  feet_yaw  = pcall(function() return anim.m_flGoalFeetYaw end)
+    local ok_sp,  speed     = pcall(function() return anim.m_flSpeed2D     end)
+    local ok_gd,  on_ground = pcall(function() return anim.m_bOnGround     end)
+    local ok_dk,  duck      = pcall(function() return anim.m_flDuckAmount  end)
+    local ok_sim, sim_time  = pcall(function() return ent.m_flSimulationTime end)
+
+    if not ok_ey or not eye_yaw then return end
+
+    feet_yaw  = (ok_fy  and feet_yaw)  or 0
+    speed     = (ok_sp  and speed)     or 0
+    on_ground = (ok_gd  and on_ground) or true
+    duck      = (ok_dk  and duck)      or 0
+    sim_time  = (ok_sim and sim_time)  or 0
+    
+    local layers = nil
+    if sw_resolver:get() or sw_antidef:get() then
+        layers = SafeGetAnimLayers(ent)
+    end
+
+    local sim_delta = sim_time - p.curr_sim_time
     if p.curr_sim_time > 0 and sim_time > 0 and sim_delta > 0 then
+        local ti = p.tick_interval or 0.015625
         p.choke = clamp(math_floor(sim_delta / ti + 0.5) - 1, 0, 16)
         
         local ox, oy, oz = SafeGetOrigin(ent)
@@ -466,80 +621,88 @@ local function updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_ya
         
         local vel_yaw = yaw_delta / sim_delta
         local acc_yaw = (vel_yaw - p.last_yaw_velocity) / sim_delta
-        local jerk_yaw = (acc_yaw - p.last_yaw_acceleration) / sim_delta
         
         p.yaw_velocity = vel_yaw
         p.yaw_acceleration = acc_yaw
-        p.yaw_jerk = jerk_yaw
         
         p.last_yaw_velocity = vel_yaw
         p.last_yaw_acceleration = acc_yaw
         
-        local abs_vel = math_abs(vel_yaw)
         local abs_acc = math_abs(acc_yaw)
-        local abs_jerk = math_abs(jerk_yaw)
-        
-        p.pattern = PAT_STATIC
-        p.flick_detected = false
-        
-        if abs_vel > 1000 then
-            p.flick_detected = true
-            if p.choke >= 5 or p.sim_shifted then
-                p.pattern = PAT_DEFENSIVE_FLICK
-            elseif abs_jerk > 500000 then
-                if p.flick_history_yaw and math_abs(yawDelta(eye_yaw, p.flick_history_yaw)) < 5 then
-                    p.pattern = PAT_FAKE_FLICK
-                else
-                    p.pattern = PAT_MICRO_FLICK
-                end
-            end
-            p.flick_history_yaw = p.last_eye_yaw
-        else
-            p.flick_history_yaw = nil
-        end
-        
-        p.last_eye_yaw = eye_yaw
         
         p.lc_state = LC_NORMAL
+        local lc_penalty = 0.0
         if p.sim_shifted then
             p.lc_state = LC_SHIFTED
+            lc_penalty = lc_penalty + 0.3
         elseif p.lc_broken then
             p.lc_state = LC_BROKEN
+            lc_penalty = lc_penalty + 0.5
         elseif p.fake_movement_burst then
             p.lc_state = LC_TELEPORT
+            lc_penalty = lc_penalty + 0.8
         end
+        
+        if p.choke > 6 then
+            lc_penalty = lc_penalty + (p.choke - 6) * 0.05
+        end
+        p.lc_confidence = clamp(1.0 - lc_penalty, 0.1, 1.0)
 
         if sw_antidef:get() then
-            local defensive_score = 0.0
-            if p.choke >= 5 then defensive_score = defensive_score + 0.3 end
-            if p.sim_shifted then defensive_score = defensive_score + 0.4 end
-            if abs_acc > 50000 then defensive_score = defensive_score + 0.2 end
-            if p.lc_broken or p.fake_movement_burst then defensive_score = defensive_score + 0.3 end
+            local indicators = 0
             
+            if p.choke >= 10 then
+                indicators = indicators + 1
+            end
+            
+            if p.sim_shifted then
+                indicators = indicators + 1
+            end
+            
+            if p.lc_broken or p.fake_movement_burst then
+                indicators = indicators + 1
+            end
+            
+            local has_anim_anomaly = false
             if layers then
                 local l3 = layers[3]
                 local l12 = layers[12]
                 if l3 and l3.m_flWeight > 0.9 and speed < 15 then
-                    defensive_score = defensive_score + 0.2
+                    has_anim_anomaly = true
                 end
                 if l12 and (l12.m_flPlaybackRate > 2.0 or l12.m_flWeight > 0.8) then
-                    defensive_score = defensive_score + 0.2
+                    has_anim_anomaly = true
                 end
             end
+            if has_anim_anomaly then
+                indicators = indicators + 1
+            end
             
-            p.defensive_confidence = clamp(defensive_score, 0.0, 1.0)
-            p.is_defensive_aa = (p.defensive_confidence >= 0.5)
-            if p.is_defensive_aa and p.pattern == PAT_STATIC then
-                p.pattern = PAT_DEFENSIVE_AA
+            if indicators >= 2 then
+                p.defensive_confidence = clamp(indicators * 0.25, 0.0, 1.0)
+                p.is_defensive_aa = true
+            else
+                p.defensive_confidence = clamp(indicators * 0.15, 0.0, 1.0)
+                p.is_defensive_aa = false
             end
         else
             p.defensive_confidence = 0.0
             p.is_defensive_aa = false
         end
         
+        local is_fake_walking = false
+        if layers then
+            local l6 = layers[6]
+            if l6 and speed > 1.0 and speed < 100.0 then
+                if l6.m_flWeight > 0.8 and l6.m_flPlaybackRate < 0.15 then
+                    is_fake_walking = true
+                end
+            end
+        end
+
         if p.is_defensive_aa then
             p.archetype = ARC_DEFENSIVE
-        elseif p.freestand_side ~= 0 and p.lock_level >= 2 then
+        elseif is_fake_walking then
             p.archetype = ARC_FREESTAND
         else
             local avg_d = p.avg_yaw_delta or 0.0
@@ -554,33 +717,16 @@ local function updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_ya
             end
         end
         
-        if p.steamid and PersistentProfiles[p.steamid] then
-            PersistentProfiles[p.steamid].archetype = p.archetype
-        end
-
-        if speed < 1.0 then
-            if not p.last_lby_update_time then
-                p.last_lby_update_time = sim_time
-                p.lby_update_predicted = false
-            elseif sim_time - p.last_lby_update_time >= 1.1 then
-                p.lby_update_predicted = true
-                p.last_lby_update_time = sim_time
-            else
-                p.lby_update_predicted = false
-            end
+        if sw_resolver:get() then
+            p.is_fakewalk = is_fake_walking
+            p.original_feet_yaw = feet_yaw
+            
+            updateAdvancedFreestand(p, ent)
+            predictTargetMovement(p, ent)
         else
-            p.last_lby_update_time = nil
-            p.lby_update_predicted = false
-        end
-
-        p.is_fakewalk = false
-        if layers then
-            local l6 = layers[6]
-            if l6 and speed > 1.0 and speed < 100.0 then
-                if l6.m_flWeight > 0.8 and l6.m_flPlaybackRate < 0.15 then
-                    p.is_fakewalk = true
-                end
-            end
+            p.is_fakewalk = false
+            p.is_accelerating = false
+            p.predicted_peek_visible = false
         end
         
         p.curr_sim_time = sim_time
@@ -599,284 +745,6 @@ local function updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_ya
     p.duck = duck
 end
 
-local function updateAdvancedFreestand(p, ent)
-    local cur_time = globals.curtime
-    if type(cur_time) == "function" then cur_time = cur_time() end
-    cur_time = cur_time or 0.0
-    
-    local is_threat = (client.current_threat() == p.id)
-    local ox, oy, oz = SafeGetOrigin(ent)
-    local dist_sq = (ox - p.last_fs_origin.x)^2 + (oy - p.last_fs_origin.y)^2 + (oz - p.last_fs_origin.z)^2
-    local moved_significantly = dist_sq > 256.0 
-    
-    local elapsed = cur_time - p.last_fs_time
-    if elapsed < 0.150 and not moved_significantly and not is_threat then
-        return
-    end
-    
-    p.last_fs_time = cur_time
-    p.last_fs_origin.x = ox
-    p.last_fs_origin.y = oy
-    p.last_fs_origin.z = oz
-    
-    local lp = entity.get_local_player()
-    if not lp then return end
-    
-    local head_pos = ent:get_eye_position()
-    local lp_pos = lp:get_eye_position()
-    if not head_pos or not lp_pos then return end
-    
-    local dir = (head_pos - lp_pos):normalized()
-    local left_dir = vector(-dir.y, dir.x, 0)
-    local right_dir = vector(dir.y, -dir.x, 0)
-    
-    local left_exposure = 0
-    local right_exposure = 0
-    local total_traces = 0
-    
-    for i = 1, #HEIGHT_OFFSETS do
-        local height = HEIGHT_OFFSETS[i]
-        local enemy_center = head_pos + vector(0, 0, height)
-        
-        for j = 1, #TEST_OFFSETS do
-            local offset = TEST_OFFSETS[j]
-            local left_pt = enemy_center + left_dir * offset
-            local right_pt = enemy_center + right_dir * offset
-            
-            local tr_l = utils.trace_line(lp_pos, left_pt, lp)
-            local tr_r = utils.trace_line(lp_pos, right_pt, lp)
-            
-            left_exposure = left_exposure + tr_l.fraction
-            right_exposure = right_exposure + tr_r.fraction
-            total_traces = total_traces + 1
-        end
-    end
-    
-    local avg_left_exp = left_exposure / total_traces
-    local avg_right_exp = right_exposure / total_traces
-    
-    local side = 0
-    if avg_left_exp < avg_right_exp then
-        side = -1
-    elseif avg_right_exp < avg_left_exp then
-        side = 1
-    end
-    
-    p.freestand_side = side
-end
-
-local function updateDesyncModel(p, ent)
-    local anim = SafeGetAnimState(ent)
-    if not anim then return end
-    
-    local feet_yaw = anim.m_flGoalFeetYaw
-    local fy_vel = 0.0
-    if p.prev_feet_yaw ~= 0.0 and p.curr_sim_time > 0 then
-        local sim_delta = anim.m_flLastUpdateTime - p.curr_sim_time
-        if sim_delta > 0 then
-            fy_vel = math_abs(yawDelta(feet_yaw, p.prev_feet_yaw)) / sim_delta
-        end
-    end
-    
-    local eye_yaw = anim.m_flEyeYaw
-    local observed_delta = math_abs(normalizeYaw(eye_yaw - feet_yaw))
-    
-    local model = p.desync_model
-    model.observed_max = math_max(model.observed_max, observed_delta)
-    model.observed_recent = observed_delta
-    model.observed_avg = model.observed_avg * 0.95 + observed_delta * 0.05
-    
-    local base_limit = p.desync_limit
-    local estimated_limit = base_limit
-    
-    local state = getTargetState(p)
-    local successful_delta = p.observed_successful[state]
-    if successful_delta and successful_delta > 0.0 then
-        estimated_limit = math_min(base_limit, successful_delta + 5.0)
-    elseif p.on_ground then
-        local observed_cap = math_max(model.observed_recent, model.observed_avg)
-        estimated_limit = math_min(base_limit, math_max(15.0, observed_cap))
-        if fy_vel > 100.0 then
-            estimated_limit = math_min(base_limit, estimated_limit + 10.0)
-        end
-    else
-        estimated_limit = 58.0
-    end
-    
-    p.resolved_delta = clamp(estimated_limit, 10.0, base_limit)
-end
-
-local function computeBrute(p, ent, layers)
-    local state = getTargetState(p)
-    local limit = p.resolved_delta or p.desync_limit
-    
-    if p.is_fakewalk then
-        limit = 28.0
-    end
-
-    if p.lby_update_predicted then
-        p.lock_level = 0
-    end
-
-    if p.lock_level == 3 and p.locked_side then
-        p.resolved_side = p.locked_side
-        p.resolved_delta = clamp(p.locked_delta or limit, 0.0, p.desync_limit)
-        return
-    elseif p.lock_level == 2 and p.locked_side then
-        p.resolved_side = p.locked_side
-        p.resolved_delta = clamp(limit, 0.0, p.desync_limit)
-        return
-    end
-
-    if p.flick_detected then
-        p.lock_level = 0
-    end
-
-    if p.lc_state == LC_BROKEN or p.lc_state == LC_TELEPORT then
-        limit = limit * 0.7
-    elseif p.lc_state == LC_SHIFTED or p.defensive_confidence > 0.5 then
-        p.lock_level = math_min(p.lock_level, 1)
-        limit = p.desync_limit
-    end
-
-    if p.lc_state == LC_TELEPORT then
-        p.resolved_side = 0
-        p.resolved_delta = 0.0
-        return
-    end
-
-    local anim = SafeGetAnimState(ent)
-    local eye_yaw = anim and anim.m_flEyeYaw or 0.0
-
-    local calculated_delta = limit
-    local calculated_side = 0
-
-    if layers and layers[3] then
-        local l3 = layers[3]
-        calculated_delta = clamp(l3.m_flWeight * 58.0, 15.0, p.desync_limit)
-        
-        local lp = entity.get_local_player()
-        if lp then
-            local lpx, lpy = SafeGetOrigin(lp)
-            local ex, ey = SafeGetOrigin(ent)
-            local to_lp = math_atan2(lpy - ey, lpx - ex) * (180 / math_pi)
-            local eye_to_lp = yawDelta(eye_yaw, to_lp)
-            calculated_side = eye_to_lp > 0 and 1 or -1
-        else
-            calculated_side = p.freestand_side ~= 0 and p.freestand_side or 1
-        end
-
-        if p.flick_detected then
-            calculated_side = -calculated_side
-        end
-    else
-        calculated_side = p.freestand_side ~= 0 and p.freestand_side or 1
-    end
-
-    local bias = 1
-    local sig = p.sig_memory[p.current_sig_hash]
-    if sig and sig.bias then
-        bias = sig.bias
-    else
-        local profile = p.profiles[state]
-        if profile and profile.bias then
-            bias = profile.bias
-        end
-    end
-
-    p.resolved_side = calculated_side * bias
-    p.resolved_delta = clamp(calculated_delta, 0.0, p.desync_limit)
-end
-
-local function updatePlayer(p, ent)
-    local ok_alive, alive = pcall(function() return ent:is_alive()   end)
-    local ok_dorm,  dorm  = pcall(function() return ent:is_dormant() end)
-    if not ok_dorm  or dorm  then return end
-
-    local anim = SafeGetAnimState(ent)
-    if not anim then return end
-
-    local ok_ey,  eye_yaw   = pcall(function() return anim.m_flEyeYaw      end)
-    local ok_fy,  feet_yaw  = pcall(function() return anim.m_flGoalFeetYaw end)
-    local ok_sp,  speed     = pcall(function() return anim.m_flSpeed2D     end)
-    local ok_gd,  on_ground = pcall(function() return anim.m_bOnGround     end)
-    local ok_dk,  duck      = pcall(function() return anim.m_flDuckAmount  end)
-    local ok_sim, sim_time  = pcall(function() return ent.m_flSimulationTime end)
-
-    if not ok_ey or not eye_yaw then return end
-
-    feet_yaw  = (ok_fy  and feet_yaw)  or 0
-    speed     = (ok_sp  and speed)     or 0
-    on_ground = (ok_gd  and on_ground) or true
-    duck      = (ok_dk  and duck)      or 0
-    sim_time  = (ok_sim and sim_time)  or 0
-    
-    local layers = SafeGetAnimLayers(ent)
-    
-    updatePlayerPhysicsAndExploits(p, ent, sim_time, eye_yaw, feet_yaw, speed, duck, layers)
-    
-    p.original_feet_yaw = feet_yaw
-    p.desync_limit = getDesyncLimit(speed, duck, on_ground)
-    
-    updateAdvancedFreestand(p, ent)
-    
-    updateDesyncModel(p, ent)
-    
-    local sig_hash = 0
-    if layers then
-        local l3 = layers[3]
-        local l6 = layers[6]
-        local l12 = layers[12]
-        
-        local l3_w = math_floor(l3.m_flWeight * 10 + 0.5)
-        local l6_w = math_floor(l6.m_flWeight * 10 + 0.5)
-        local l6_r = math_floor(clamp(l6.m_flPlaybackRate, 0, 5) * 4 + 0.5)
-        local spd = math_floor(clamp(speed, 0, 300) / 30)
-        local choke_val = clamp(p.choke, 0, 16)
-        
-        sig_hash = l3_w + l6_w * 16 + l6_r * 256 + spd * 8192 + choke_val * 131072
-    end
-    p.current_sig_hash = sig_hash
-    
-    p.prev_feet_yaw = feet_yaw
-    
-    computeBrute(p, ent, layers)
-    
-    local resolved_y = normalizeYaw(eye_yaw + p.resolved_side * p.resolved_delta)
-    anim.m_flGoalFeetYaw    = resolved_y
-    anim.m_flCurrentFeetYaw = resolved_y
-end
-
-local function shouldForceBAIM(p, hp)
-    if not sw_lethal:get() then return false end
-    if not p then return false end
-
-    local cm = p.consecutive_resolver_misses
-
-    local is_lethal = hp <= 35 or (hp <= 65 and cm >= 1)
-    local low_reliability = (cm >= 2)
-    
-    if is_lethal then return true end
-    if low_reliability then return true end
-    if p.pattern == PAT_DEFENSIVE_FLICK or p.pattern == PAT_DEFENSIVE_AA then return true end
-    
-    return false
-end
-
-local function shouldPreferSafe(p)
-    if not sw_safepoint:get() then return false end
-    if not p then return false end
-
-    local cm = p.consecutive_resolver_misses
-    local active_exploit = p.lc_broken or p.sim_shifted or p.fake_movement_burst or p.is_defensive_aa
-    
-    if cm >= 1 or p.lby_update_predicted then return true end
-    if p.choke > 6 or active_exploit then return true end
-    if p.pattern == PAT_FAKE_FLICK or p.pattern == PAT_MICRO_FLICK or p.pattern == PAT_DEFENSIVE_FLICK then return true end
-    
-    return false
-end
-
 local function getThreatScore(ent, lp_x, lp_y, lp_z)
     local ex, ey, ez = SafeGetOrigin(ent)
     local dist = math_sqrt((lp_x-ex)^2 + (lp_y-ey)^2 + (lp_z-ez)^2) * 0.0254
@@ -887,7 +755,7 @@ local function getThreatScore(ent, lp_x, lp_y, lp_z)
 end
 
 local function getBestTarget(enemies)
-    local lp = entity.get_local_player()
+    local lp = entity_get_local_player()
     if not lp then return nil end
     
     if not sw_priority:get() then
@@ -909,9 +777,22 @@ local function getBestTarget(enemies)
             local ok_a, a = pcall(function() return e:is_alive()   end)
             local ok_d, d = pcall(function() return e:is_dormant() end)
             if ok_a and a and ok_d and not d then
-                local score = getThreatScore(e, lx, ly, lz)
-                if score > best_score then
-                    best_score = score
+                local id = e:get_index()
+                local p = EnemyRecords[id]
+                
+                local threat_score = getThreatScore(e, lx, ly, lz)
+                local resolver_confidence = p and p.resolver_confidence or 0.50
+                local defensive_score = p and (1.0 - p.defensive_confidence) or 1.0
+                local visibility_score = p and p.visibility_score or 0.0
+                
+                local hp = SafeGetHP(e)
+                local lethality_score = (hp <= 35) and 1.0 or (hp <= 65 and 0.5 or 0.0)
+                
+                local norm_threat = threat_score / 170.0
+                local priority_score = norm_threat + resolver_confidence + defensive_score + visibility_score + lethality_score
+                
+                if priority_score > best_score then
+                    best_score = priority_score
                     best_ent   = e
                 end
             end
@@ -921,14 +802,20 @@ local function getBestTarget(enemies)
     return best_ent
 end
 
+local function restorePlayerPlist(id)
+    plist_set(id, "Override prefer body aim", "-")
+    plist_set(id, "Override prefer safe point", "-")
+    plist_cache[id] = nil
+end
+
 EnemyRecords = {}
 
 register_event("net_update_start", function()
-    if not sw_resolver:get() then return end
+    if not sw_resolver:get() and not sw_antidef:get() then return end
 
-    local lp      = entity.get_local_player()
+    local lp      = entity_get_local_player()
     if not lp then return end
-    local enemies = entity.get_players(true, false)
+    local enemies = entity_get_players(true, false)
     if not enemies then return end
 
     for i = 1, #enemies do
@@ -945,42 +832,10 @@ register_event("net_update_start", function()
                     end
                     pcall(updatePlayer, EnemyRecords[id], ent)
                 else
-                    EnemyRecords[id] = nil
-                end
-            end
-        end
-    end
-end)
-
-register_event("pre_render", function()
-    if not sw_resolver:get() then return end
-
-    local lp      = entity.get_local_player()
-    local enemies = entity.get_players(true, false)
-    if not enemies then return end
-
-    for i = 1, #enemies do
-        local ent = enemies[i]
-        if ent ~= lp then
-            local ok_id, id = pcall(function() return ent:get_index() end)
-            if ok_id then
-                local p = EnemyRecords[id]
-                if p then
-                    pcall(function()
-                        local ok_a, a = pcall(function() return ent:is_alive()   end)
-                        local ok_d, d = pcall(function() return ent:is_dormant() end)
-                        if (ok_a and a) and not (ok_d and d) then
-                            local anim = SafeGetAnimState(ent)
-                            if anim then
-                                local ok_ey, eye_yaw = pcall(function() return anim.m_flEyeYaw end)
-                                if ok_ey and eye_yaw then
-                                    local resolved = normalizeYaw(eye_yaw + p.resolved_side * p.resolved_delta)
-                                    anim.m_flGoalFeetYaw    = resolved
-                                    anim.m_flCurrentFeetYaw = resolved
-                                end
-                            end
-                        end
-                    end)
+                    if EnemyRecords[id] then
+                        restorePlayerPlist(id)
+                        EnemyRecords[id] = nil
+                    end
                 end
             end
         end
@@ -994,13 +849,13 @@ register_event("aim_fire", function(e)
     
     aimbot_data[e.id] = {
         target = e.target,
-        side = p.resolved_side,
-        delta = p.resolved_delta,
         hitgroup = e.hitgroup,
-        sig_hash = p.current_sig_hash,
         state = getTargetState(p),
-        lock_level = p.lock_level,
-        choke = p.choke
+        choke = p.choke,
+        resolver_confidence = p.resolver_confidence,
+        defensive_confidence = p.defensive_confidence,
+        lc_state = p.lc_state,
+        archetype = p.archetype
     }
 end)
 
@@ -1016,17 +871,18 @@ register_event("aim_ack", function(e)
     p.consecutive_resolver_hits = p.consecutive_resolver_hits + 1
     p.consecutive_resolver_misses = 0
     
-    if p.consecutive_resolver_hits >= 3 then
-        p.lock_level = 3
-    elseif p.consecutive_resolver_hits == 2 then
-        p.lock_level = 2
-    else
-        p.lock_level = 1
+    local is_moving = (shot.state == "moving")
+    local is_defensive = (shot.defensive_confidence > 0.49)
+    local is_exploit = (shot.state == "exploit" or shot.lc_state > 0)
+    local is_high_choke = (shot.choke >= 5)
+    
+    local confidence_gain = 0.01
+    if is_moving or is_defensive or is_exploit or is_high_choke then
+        confidence_gain = 0.15
     end
     
-    p.locked_side = shot.side
-    p.locked_delta = shot.delta
-    p.observed_successful[shot.state] = shot.delta
+    p.resolver_confidence = clamp(p.resolver_confidence + confidence_gain, 0.1, 1.0)
+    recordShot(p.steamid, shot.state, shot.choke, shot.resolver_confidence, shot.defensive_confidence, shot.lc_state, shot.archetype, shot.hitgroup, "hit")
 end)
 
 register_event("aim_miss", function(e)
@@ -1039,41 +895,29 @@ register_event("aim_miss", function(e)
     if not p then return end
     
     local reason = (type(e.reason) == "string") and e.reason:lower() or "unknown"
-    local side = shot.side
-    local state = shot.state
-    local sig_hash = shot.sig_hash
     
     if reason == "resolver" or reason == "correction" then
         p.consecutive_resolver_hits = 0
         p.consecutive_resolver_misses = p.consecutive_resolver_misses + 1
-        p.lock_level = math_max(0, p.lock_level - 1)
-        
-        if sig_hash ~= 0 then
-            p.sig_memory[sig_hash] = p.sig_memory[sig_hash] or { bias = 1 }
-            p.sig_memory[sig_hash].bias = -p.sig_memory[sig_hash].bias
-        end
-        
-        local profile = p.profiles[state]
-        if profile then
-            profile.bias = -(profile.bias or 1)
-        end
+        p.resolver_confidence = clamp(p.resolver_confidence - 0.20, 0.1, 1.0)
+        recordShot(p.steamid, shot.state, shot.choke, shot.resolver_confidence, shot.defensive_confidence, shot.lc_state, shot.archetype, shot.hitgroup, "miss")
     end
 end)
 
 register_event("createmove", function(cmd)
-    if not sw_resolver:get() then
+    if not sw_resolver:get() and not sw_antidef:get() then
         if last_baim   ~= nil then if native_baim   then native_baim:override()   end; last_baim   = nil  end
         if last_safe   ~= nil then if native_safe   then native_safe:override()   end; last_safe   = nil  end
         if last_mindam ~= -1  then if native_mindam then native_mindam:override() end; last_mindam = -1   end
         return
     end
 
-    local lp = entity.get_local_player()
+    local lp = entity_get_local_player()
     if not lp then return end
     local ok_lp_alive, lp_alive = pcall(function() return lp:is_alive() end)
     if not ok_lp_alive or not lp_alive then return end
 
-    local enemies = entity.get_players(true, false)
+    local enemies = entity_get_players(true, false)
     if not enemies or #enemies == 0 then
         if last_baim   ~= nil then if native_baim   then native_baim:override()   end; last_baim   = nil end
         if last_safe   ~= nil then if native_safe   then native_safe:override()   end; last_safe   = nil end
@@ -1102,27 +946,69 @@ register_event("createmove", function(cmd)
 
     local hp = SafeGetHP(best)
 
-    local want_baim = shouldForceBAIM(p, hp)
+    local want_baim = false
+    if sw_lethal:get() then
+        local state = getTargetState(p)
+        local state_accuracy, state_shots = getShotMatrixAccuracy(p.steamid, state)
+        
+        local is_lethal = hp <= 40
+        
+        local is_defensive = p.defensive_confidence > 0.70
+        
+        local low_confidence_and_accuracy = (p.resolver_confidence < 0.40) and (state_shots >= 3 and state_accuracy < 0.50)
+        
+        local is_exploit_state = (state == "exploit")
+        local exploit_unreliable = is_exploit_state and (p.lc_confidence < 0.50 or (state_shots >= 3 and state_accuracy < 0.50))
+        
+        local not_head_peeking = p.visibility_score > 0.30
+        
+        if (is_lethal or is_defensive or low_confidence_and_accuracy or exploit_unreliable) and not_head_peeking then
+            want_baim = true
+        end
+    end
+
     if want_baim then
+        plist_set(bid, "Override prefer body aim", "On")
         if last_baim ~= "force" then
             if native_baim then native_baim:override("force") end
             last_baim = "force"
         end
     else
+        plist_set(bid, "Override prefer body aim", "-")
         if last_baim ~= nil then
             if native_baim then native_baim:override() end
             last_baim = nil
         end
     end
 
-    local want_safe = shouldPreferSafe(p)
+    local want_safe = false
+    if sw_safepoint:get() then
+        local state = getTargetState(p)
+        local state_accuracy, state_shots = getShotMatrixAccuracy(p.steamid, state)
+        
+        local high_defensive = (p.defensive_confidence > 0.60)
+        local unstable_lc = (p.lc_confidence < 0.60)
+        local low_accuracy = (state_shots >= 3 and state_accuracy < 0.50)
+        
+        local is_unstable_angle = (p.archetype == ARC_JITTER or p.archetype == ARC_RANDOM) and (p.resolver_confidence < 0.45)
+        
+        local is_wall_peeking = (p.visibility_score < 0.60 and p.freestand_confidence > 0.50)
+        local is_peeking = p.predicted_peek_visible
+        
+        if high_defensive or unstable_lc or low_accuracy or is_unstable_angle or is_wall_peeking or is_peeking then
+            want_safe = true
+        end
+    end
+
     if want_safe then
+        plist_set(bid, "Override prefer safe point", "On")
         local mode = (p.consecutive_resolver_misses >= 2) and "force" or "prefer"
         if last_safe ~= mode then
             if native_safe then native_safe:override(mode) end
             last_safe = mode
         end
     else
+        plist_set(bid, "Override prefer safe point", "-")
         if last_safe ~= nil then
             if native_safe then native_safe:override() end
             last_safe = nil
@@ -1142,11 +1028,11 @@ register_event("createmove", function(cmd)
                 end
             end
         end
-    elseif p.consecutive_resolver_misses >= 1 then
+    elseif p.resolver_confidence < 0.5 then
         local ok_md, base_md = pcall(function() return native_mindam:get() end)
         if ok_md and base_md then
-            local factor = math_max(0.4, 1.0 - (p.consecutive_resolver_misses * 0.15))
-            target_md = math_max(1, math_floor(base_md * factor))
+            local reduction_factor = clamp(p.resolver_confidence * 1.5, 0.4, 0.95)
+            target_md = math_max(1, math_floor(base_md * reduction_factor))
         end
     end
 
@@ -1161,17 +1047,77 @@ register_event("createmove", function(cmd)
             last_mindam = -1
         end
     end
+
+    local target_hc = -1
+    if native_hitchance then
+        local ok_hc, base_hc = pcall(function() return native_hitchance:get() end)
+        if ok_hc and base_hc then
+            local adjusted_hc = base_hc
+            local conf = p.resolver_confidence
+            
+            if conf > 0.85 then
+                adjusted_hc = math_floor(base_hc * 0.95)
+            elseif conf < 0.50 then
+                adjusted_hc = math_floor(base_hc * 1.10)
+            end
+            
+            if p.is_defensive_aa or p.lc_state == LC_BROKEN or p.lc_state == LC_TELEPORT or p.predicted_peek_visible or p.is_accelerating then
+                adjusted_hc = math_floor(adjusted_hc * 1.15)
+            end
+            
+            local safe_floor = math_max(35, math_min(base_hc, 35))
+            target_hc = math_max(safe_floor, math_min(adjusted_hc, 100))
+        end
+    end
+
+    if target_hc ~= -1 then
+        if last_hitchance ~= target_hc then
+            if native_hitchance then native_hitchance:override(target_hc) end
+            last_hitchance = target_hc
+        end
+    else
+        if last_hitchance ~= nil then
+            if native_hitchance then native_hitchance:override() end
+            last_hitchance = nil
+        end
+    end
+
+    local want_delayshot = false
+    if native_delayshot then
+        local unstable_lc = (p.lc_confidence < 0.60)
+        local is_volatile = p.is_defensive_aa or p.predicted_peek_visible or p.is_accelerating or unstable_lc
+        if is_volatile then
+            want_delayshot = true
+        end
+    end
+
+    if want_delayshot then
+        if last_delayshot ~= true then
+            if native_delayshot then native_delayshot:override(true) end
+            last_delayshot = true
+        end
+    else
+        if last_delayshot ~= nil then
+            if native_delayshot then native_delayshot:override() end
+            last_delayshot = nil
+        end
+    end
 end)
 
 register_event("round_start", function()
     EnemyRecords = {}
     aimbot_data  = {}
+    plist_cache  = {}
     last_baim    = nil
     last_safe    = nil
     last_mindam  = -1
+    last_hitchance = nil
+    last_delayshot = nil
     if native_baim   then pcall(function() native_baim:override()   end) end
     if native_safe   then pcall(function() native_safe:override()   end) end
     if native_mindam then pcall(function() native_mindam:override() end) end
+    if native_hitchance then pcall(function() native_hitchance:override() end) end
+    if native_delayshot then pcall(function() native_delayshot:override() end) end
 end)
 
 register_event("shutdown", function()
@@ -1179,6 +1125,11 @@ register_event("shutdown", function()
     if native_safe      then pcall(function() native_safe:override()      end) end
     if native_mindam    then pcall(function() native_mindam:override()    end) end
     if native_hitchance then pcall(function() native_hitchance:override() end) end
+    if native_delayshot then pcall(function() native_delayshot:override() end) end
+    for id, _ in pairs(EnemyRecords) do
+        restorePlayerPlist(id)
+    end
     EnemyRecords = {}
     aimbot_data  = {}
+    plist_cache  = {}
 end)
