@@ -1595,6 +1595,13 @@ register_event("createmove", function(cmd)
     if not ok_bid then return end
 
     local p  = EnemyRecords[bid]
+    if not p then
+        if last_baim   ~= nil then if native_baim   then native_baim:override()   end; last_baim   = nil end
+        if last_safe   ~= nil then if native_safe   then native_safe:override()   end; last_safe   = nil end
+        if last_mindam ~= -1  then if native_mindam then native_mindam:override() end; last_mindam = -1  end
+        return
+    end
+
     local hp = SafeGetHP(best)
 
     local want_baim = shouldForceBAIM(p, hp)
